@@ -105,7 +105,7 @@ All operational settings automatically persist to ESP32 flash memory via the `Pr
 
 * `offsetX` / `offsetY`: X and Y optical offset coordinates
 
-## 🛠️ Serial Debug Console
+##  Serial Debug Console
 
 Serial logging is controlled by the macro definition at the top of `Dart_firmware_3_0.ino`:
 
