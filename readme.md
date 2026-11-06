@@ -2,7 +2,7 @@
 
 Firmware for the Dart1 Thermal Camera module utilizing an ESP32 micro-controller and a 5-button navigation interface. Features full runtime configuration over UART protocol, non-volatile parameter persistence, electronic zoom, and optical alignment via X/Y offset calibration.
 
-## 🔘 Pinout & Hardware Controls Summary
+##  Pinout & Hardware Controls Summary
 
 ### Hardware Connections
 
