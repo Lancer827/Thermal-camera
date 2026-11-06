@@ -2,8 +2,7 @@
 #include <Preferences.h>
 
 // Dart1 Firmware - IRcamera Protocol Prototype
-// Based on IRcamera Detailed Command Set[cite: 1].
-// Preserves original button mapping and behavior[cite: 1].
+// Based on IRcamera Detailed Command Set[cite: 1, 2].
 #define VERBOSE  1
 
 #define NAV_LEFT_PIN 0
@@ -16,6 +15,7 @@
 #define RX_PIN 20
 #define TX_PIN 21
 
+#define CALIBRATION_MULTIPLIER 1
 #define MAX_PALLETS 6
 
 /*****************Data Structures**************************/
@@ -26,7 +26,7 @@ typedef struct {
     uint16_t reserved0;           // Reserved[cite: 1]
     uint16_t img_w;               // Sensor input image width[cite: 1]
     uint16_t img_h;               // Sensor input image height[cite: 1]
-    uint16_t fps_x10;             // Framerate x10 (e.g., 500 = 50.0 fps)[cite: 1]
+    uint16_t fps_x10;             // Framerate x10[cite: 1]
     uint16_t vo_w;                // Current video output width[cite: 1]
     uint16_t vo_h;                // Current video output height[cite: 1]
     uint8_t  run_isp;             // ISP main pipeline running status[cite: 1]
@@ -66,10 +66,14 @@ int contrastIdx = 3;
 int contrastSteps[8] = {13, 25, 38, 50, 63, 75, 88, 100};
 uint8_t pseudocolor = 6;
 uint16_t zoomX10 = 10;
+int16_t offsetX = 0;
+int16_t offsetY = 0;
 bool autoCalEnabled = false;
+bool offsetCalibrationMode = false;
 runtime_status_t status;
 
-unsigned long thumbDownTime = 0, navMidDownTime = 0, lastBtnPressTime = 0, lastNavMoveTime = 0, lastExtraPressTime = 0, thumbActionCooldown = 0;
+unsigned long thumbDownTime = 0, navMidDownTime = 0, lastBtnPressTime = 0, lastNavMoveTime = 0;
+unsigned long lastExtraPressTime = 0, extraDownTime = 0, thumbActionCooldown = 0;
 bool thumbWasInteracted = false;
 
 /*************Function Prototypes************/
@@ -89,11 +93,13 @@ void setBrightness(uint8_t);
 void setContrast(uint8_t);
 void enablePseudoColor();
 void setPseudocolor(uint8_t);
-void setZoom(uint16_t);
+int getMinAllowedZoom();
+void applyZoomAndOffset();
 void setScreenBrightness(int);
 void setMiscStartupCommands(void);
 void runtimeStatusQuery(void);
 void parseStatus(uint8_t *);
+void printCalibrationVisual();
 
 /***************Functions*******************/
 
@@ -107,6 +113,7 @@ uint16_t crc16_modbus(const uint8_t *buf, uint32_t len){
 }
 
 void printHex(const char* label, const uint8_t* data, size_t len) {
+  if (!VERBOSE) return;
   Serial.print(label);
   for (size_t i = 0; i < len; i++) {
     if (data[i] < 16) Serial.print("0");
@@ -128,6 +135,7 @@ void sendFrame(uint8_t rw, uint8_t cmd, uint8_t sub, const uint8_t *data, uint8_
 }
 
 void ph(uint8_t b) {
+  if (!VERBOSE) return;
   if (b < 0x10) Serial.print('0');
   Serial.print(b, HEX);
 }
@@ -142,21 +150,25 @@ void readResponse(uint32_t timeoutMs = 450) {
   uint8_t rxBuffer[100];
   uint16_t rxBuffIndex = 0;
 
-  Serial.print("RX: ");
+  if (VERBOSE) Serial.print("RX: ");
   while (millis() - start < timeoutMs) {
     while (cam.available()) {
       uint8_t b = cam.read();
       got = true;
       last = millis();
-      ph(b);
-      Serial.print(' ');
+      if (VERBOSE) {
+        ph(b);
+        Serial.print(' ');
+      }
       if (rxBuffIndex < 100) rxBuffer[rxBuffIndex++] = b;
     }
     if (got && millis() - last > 50) break;
     delay(1);
   }
-  if (!got) Serial.print("<no data>");
-  Serial.println();
+  if (VERBOSE) {
+    if (!got) Serial.print("<no data>");
+    Serial.println();
+  }
 
   if (rxBuffer[4] == 0xE0 && rxBuffer[5] == 0) {
     parseStatus(rxBuffer);
@@ -170,16 +182,9 @@ void sendCommandAndRead(uint8_t rw, uint8_t cmd, uint8_t sub, const uint8_t *dat
   readResponse();
 }
 
-void manualShutter() { 
-  sendCommandAndRead(0x00, 0x40, 0x00); 
-}
-
+void manualShutter() { sendCommandAndRead(0x00, 0x40, 0x00); }
 void logicalOOC()    { sendCommandAndRead(0x00, 0x10, 0x02); }
-
-void autoShutter(bool en) { 
-  sendCommandAndRead(0x00, 0x40, en ? 0x03 : 0x04); 
-}
-
+void autoShutter(bool en) { sendCommandAndRead(0x00, 0x40, en ? 0x03 : 0x04); }
 void saveParams()    { sendCommandAndRead(0x00, 0x40, 0xFF); }
 
 void writeISP(uint8_t mask){
@@ -188,15 +193,12 @@ void writeISP(uint8_t mask){
 }
 
 void setBrightness(uint8_t v) { 
-  isp.luma = v; 
-  brightness = v; 
-  writeISP(0x02); 
+  isp.luma = v; brightness = v; writeISP(0x02); 
   preferences.putInt("brightness", brightness);
 }
 
 void setContrast(uint8_t v)   { 
-  isp.contrast = v; 
-  writeISP(0x04); 
+  isp.contrast = v; writeISP(0x04); 
   preferences.putInt("contrastIdx", contrastIdx);
 }
 
@@ -208,7 +210,7 @@ void enablePseudoColor() {
     0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x45, 0x20
   };
   clearRx();
-  Serial.println("[CORE] Pseudo-Color activated");
+  if (VERBOSE) Serial.println("[CORE] Pseudo-Color activated");
   cam.write(raw, sizeof(raw));
   cam.flush();
   readResponse();
@@ -217,34 +219,60 @@ void enablePseudoColor() {
 void setPseudocolor(uint8_t slot) {
   if (slot > MAX_PALLETS) return;
   uint8_t d[4] = {0x00, 0x00, 0x00, slot};
-  Serial.print("[PALETTE] ");
-  Serial.println(slot);
+  if (VERBOSE) {
+    Serial.print("[PALETTE] "); 
+    Serial.println(slot);
+  }
   sendCommandAndRead(0x00, 0xE2, 0x04, d, 4);
   preferences.putUChar("pseudocolor", slot);
 }
 
-void setZoom(uint16_t ratioX10){
- uint8_t d[14] = {0};
- d[0] = 0; // center anchor
- d[1] = 1; // horizontal mirror
- d[4] = (ratioX10 >> 8) & 0xFF;
- d[5] = ratioX10 & 0xFF;
- sendCommandAndRead(0x00, 0xE1, 0x03, d, 14);
- preferences.putUShort("zoomX10", ratioX10);
+// Calculate minimum zoom required to support current X/Y offsets without going out of bounds
+int getMinAllowedZoom() {
+  int reqZoomX = (abs(offsetX) > 0) ? max(10, (3200 / (320 - abs(offsetX)) + 1)) : 10;
+  int reqZoomY = (abs(offsetY) > 0) ? max(10, (2560 / (256 - abs(offsetY)) + 1)) : 10;
+  return max(10, max(reqZoomX, reqZoomY));
+}
+
+// Applies Electronic Zoom and X/Y offset via ROI mode (Command 0xE1/0x03, type=5)[cite: 2]
+void applyZoomAndOffset() {
+  uint16_t win_w = (640 * 10) / zoomX10;
+  uint16_t win_h = (512 * 10) / zoomX10;
+
+  // Clamp offsets to current zoom window constraints
+  int maxOffsetX = 320 - (win_w / 2);
+  int maxOffsetY = 256 - (win_h / 2);
+  offsetX = constrain(offsetX, -maxOffsetX, maxOffsetX);
+  offsetY = constrain(offsetY, -maxOffsetY, maxOffsetY);
+
+  uint16_t roi_x = 320 + offsetX - (win_w / 2);
+  uint16_t roi_y = 256 + offsetY - (win_h / 2);
+
+  uint8_t d[14] = {0};
+  d[0] = 5;   // type = 5 (ROI region)[cite: 2]
+  d[1] = 1;   // horizontal mirror
+  d[2] = 0;   // vertical mirror
+  d[3] = 1;   // flags: bit0 = save immediately[cite: 2]
+  d[6]  = (roi_x >> 8) & 0xFF; d[7]  = roi_x & 0xFF;
+  d[8]  = (roi_y >> 8) & 0xFF; d[9]  = roi_y & 0xFF;
+  d[10] = (win_w >> 8) & 0xFF; d[11] = win_w & 0xFF;
+  d[12] = (win_h >> 8) & 0xFF; d[13] = win_h & 0xFF;
+
+  sendCommandAndRead(0x00, 0xE1, 0x03, d, 14);
+  
+  preferences.putUShort("zoomX10", zoomX10);
+  preferences.putInt("offsetX", offsetX);
+  preferences.putInt("offsetY", offsetY);
 }
 
 void setScreenBrightness(int delta){
  screenBrightness = constrain(screenBrightness + delta, screenBrightnessMin, screenBrightnessMax);
  if (delta > 0){
-  digitalWrite(SCREEN_BRIGHT_PLUS, LOW);
-  delay(100);
-  digitalWrite(SCREEN_BRIGHT_PLUS, HIGH);
-  Serial.print("Screen Brightness +");
+  digitalWrite(SCREEN_BRIGHT_PLUS, LOW); delay(100); digitalWrite(SCREEN_BRIGHT_PLUS, HIGH);
+  if (VERBOSE) Serial.print("Screen Brightness +");
  } else {
-  digitalWrite(SCREEN_BRIGHT_MINUS, LOW);
-  delay(100);
-  digitalWrite(SCREEN_BRIGHT_MINUS, HIGH);
-  Serial.print("Screen Brightness -");
+  digitalWrite(SCREEN_BRIGHT_MINUS, LOW); delay(100); digitalWrite(SCREEN_BRIGHT_MINUS, HIGH);
+  if (VERBOSE) Serial.print("Screen Brightness -");
  }
  preferences.putInt("screenBright", screenBrightness);
 }
@@ -253,14 +281,10 @@ void setMiscStartupCommands(void) {
   uint8_t fData[4] = {0x00, 0x00, 0x00, 0x00};
   sendCommandAndRead(0x00, 0xE6, 0x05, fData, 4);
   delay(150);
-
-  uint8_t gData[10] = {0x02, 0x80, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00};
-  sendCommandAndRead(0x00, 0xE1, 0x00, gData, 10);
-  delay(150);
 }
 
 void runtimeStatusQuery(void) {
-  Serial.println("Status: ");
+  if (VERBOSE) Serial.println("Status: ");
   sendCommandAndRead(0x01, 0xE0, 0x00);
 }
 
@@ -281,11 +305,22 @@ void parseStatus(uint8_t * pRxBuff) {
   }
 }
 
+void printCalibrationVisual() {
+  if (!VERBOSE) return;
+  Serial.println("========================================");
+  Serial.printf(" [OFFSET CALIB MODE] X: %+4d | Y: %+4d\n", offsetX, offsetY);
+  Serial.printf(" [ZOOM] %.1fx\n", zoomX10 / 10.0);
+  Serial.println(" Controls:");
+  Serial.println("   - [Left / Right]          : Pan X Offset");
+  Serial.println("   - [Thumb + Left / Right]  : Pan Y Offset");
+  Serial.println("   - [Extra Long Press >1.5s]: Save & Exit Mode");
+  Serial.println("========================================");
+}
+
 void setup(){
  Serial.begin(115200);
  cam.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
  
- // Initialize Preferences and load saved state
  preferences.begin("dart1", false);
  autoCalEnabled = preferences.getBool("autocal", false);
  brightness = preferences.getInt("brightness", 100);
@@ -293,6 +328,8 @@ void setup(){
  contrastIdx = preferences.getInt("contrastIdx", 3);
  pseudocolor = preferences.getUChar("pseudocolor", 6);
  zoomX10 = preferences.getUShort("zoomX10", 10);
+ offsetX = preferences.getInt("offsetX", 0);
+ offsetY = preferences.getInt("offsetY", 0);
  
  pinMode(NAV_LEFT_PIN, INPUT_PULLUP);
  pinMode(NAV_RIGHT_PIN, INPUT_PULLUP);
@@ -306,7 +343,6 @@ void setup(){
  digitalWrite(SCREEN_BRIGHT_MINUS, HIGH);
  delay(5000);
 
- // Synchronize camera hardware state with restored non-volatile preferences on boot
  setMiscStartupCommands();
  delay(150);
  autoShutter(autoCalEnabled);
@@ -319,11 +355,11 @@ void setup(){
  delay(150);
  setBrightness(brightness);
  delay(150);
- setZoom(zoomX10);
+ applyZoomAndOffset();
  delay(150);
 
  runtimeStatusQuery();
- if(VERBOSE) Serial.println("Camera online.");
+ if (VERBOSE) Serial.println("Camera online.");
 }
 
 void loop(){
@@ -332,6 +368,37 @@ void loop(){
  bool mid = digitalRead(NAV_MID_PIN) == LOW;
  bool extra = digitalRead(EXTRA_BUTTON_PIN) == LOW;
 
+ // Extra Button Long Press (>1.5s) toggles Offset Calibration Mode
+ if (extra) {
+   if (extraDownTime == 0) extraDownTime = now;
+   else if (now - extraDownTime > 1500 && now - lastExtraPressTime > 1000) {
+     offsetCalibrationMode = !offsetCalibrationMode;
+     lastExtraPressTime = now;
+     extraDownTime = 0;
+     if (offsetCalibrationMode) {
+       if (VERBOSE) Serial.println("[UI] >>> ENTERED OFFSET CALIBRATION MODE <<<");
+       printCalibrationVisual();
+     } else {
+       saveParams();
+       if (VERBOSE) Serial.println("[UI] >>> EXITED OFFSET CALIBRATION MODE (Saved) <<<");
+     }
+   }
+ } else {
+   if (extraDownTime > 0) {
+     unsigned long hold = now - extraDownTime;
+     // Short press of extra button toggles auto-calibration (when not in cal mode)
+     if (hold > 50 && hold < 1000 && !offsetCalibrationMode) {
+       autoCalEnabled = !autoCalEnabled;
+       autoShutter(autoCalEnabled);
+       delay(150);
+       saveParams();
+       preferences.putBool("autocal", autoCalEnabled);
+       if (VERBOSE) Serial.printf("Auto-calibration: %s\n", autoCalEnabled ? "ON" : "OFF");
+     }
+     extraDownTime = 0;
+   }
+ }
+
  // Capture left and right navigation
  int delta = 0;
  if(now - lastNavMoveTime > 200){
@@ -339,70 +406,91 @@ void loop(){
    else if(digitalRead(NAV_RIGHT_PIN) == LOW) { delta = 1; lastNavMoveTime = now; }
  }
 
- // Navigating left and right
- if(delta){
-   if(thumb){
-     thumbWasInteracted = true;
-     brightness = constrain(brightness + delta * 2, 0, 100);
-     setBrightness(brightness);
-     if(VERBOSE) Serial.printf("Set brightness: %d\n", brightness);
-   } else if (extra) {
-     setScreenBrightness(delta);
-   } else {
-     zoomX10 = constrain((int)zoomX10 + delta, 10, 70);
-     setZoom(zoomX10);
-     if(VERBOSE) Serial.printf("Set zoom: %d\n", zoomX10);
-   }
- } 
- // Extra button press by itself: toggle auto calibration
- else if(extra && now - lastExtraPressTime > 350){
-   autoCalEnabled = !autoCalEnabled;
-   autoShutter(autoCalEnabled);
-   delay(150);
-   saveParams();
-   preferences.putBool("autocal", autoCalEnabled);
-   lastExtraPressTime = now;
- }
+// Handling input based on current mode
+ if (offsetCalibrationMode) {
+   // --- OFFSET CALIBRATION MODE CONTROLS ---
+   if (delta) {
+     if (thumb) {
+       // Thumb + Left/Right adjusts Y Offset
+       offsetY += delta * CALIBRATION_MULTIPLIER;
+       if (VERBOSE) Serial.printf("[CALIB] Adjusted Offset Y: %d\n", offsetY);
+     } else {
+       // Left/Right alone adjusts X Offset
+       offsetX += delta * CALIBRATION_MULTIPLIER;
+       if (VERBOSE) Serial.printf("[CALIB] Adjusted Offset X: %d\n", offsetX);
+     }
 
- // Middle navigation press
- if(mid){
-   if(navMidDownTime == 0) navMidDownTime = now;
-   if(thumb && now - navMidDownTime > 3000){
-     logicalOOC();
-     if(VERBOSE) Serial.println("Manual OOC");
-     navMidDownTime = 0;
-     thumbWasInteracted = true;
+     int minAllowedZoom = getMinAllowedZoom();
+     if (zoomX10 < minAllowedZoom) {
+       zoomX10 = minAllowedZoom;
+       if (VERBOSE) Serial.printf("[CALIB] Min zoom automatically raised to %.1fx to support offset\n", zoomX10 / 10.0);
+     }
+
+     applyZoomAndOffset();
+     printCalibrationVisual();
    }
- } else if(navMidDownTime){
-   if(now - navMidDownTime < 2000 && now - lastBtnPressTime > 450){
+ } else {
+   // --- NORMAL OPERATING MODE CONTROLS ---
+   if(delta){
      if(thumb){
        thumbWasInteracted = true;
-       contrastIdx = (contrastIdx + 1) % 8;
-       setContrast(contrastSteps[contrastIdx]);
-       if(VERBOSE) Serial.printf("Set contrast: %d\n", contrastIdx);
+       brightness = constrain(brightness + delta * 2, 0, 100);
+       setBrightness(brightness);
+       if (VERBOSE) Serial.printf("Set brightness: %d\n", brightness);
+     } else if (extra) {
+       setScreenBrightness(delta);
      } else {
-       pseudocolor = (pseudocolor + 1) % MAX_PALLETS;
-       setPseudocolor(pseudocolor);
-       if(VERBOSE) Serial.printf("Set pseudocolor: %d\n", pseudocolor);
+       // Regular zoom change: clamp zoom and respect the minimum allowed zoom for current offsets
+       zoomX10 = constrain((int)zoomX10 + delta, 10, 70);
+       int minAllowedZoom = getMinAllowedZoom();
+       if (zoomX10 < minAllowedZoom) {
+         zoomX10 = minAllowedZoom; // Prevent zooming out past what the current offset permits
+       }
+       applyZoomAndOffset();
+       if (VERBOSE) Serial.printf("Set zoom: %.1fx\n", zoomX10 / 10.0);
      }
+   } 
+   
+   // Middle navigation press handling
+   if(mid){
+     if(navMidDownTime == 0) navMidDownTime = now;
+     if(thumb && now - navMidDownTime > 3000){
+       logicalOOC();
+       if (VERBOSE) Serial.println("Manual OOC");
+       navMidDownTime = 0;
+       thumbWasInteracted = true;
+     }
+   } else if(navMidDownTime){
+     if(now - navMidDownTime < 2000 && now - lastBtnPressTime > 450){
+       if(thumb){
+         thumbWasInteracted = true;
+         contrastIdx = (contrastIdx + 1) % 8;
+         setContrast(contrastSteps[contrastIdx]);
+         if (VERBOSE) Serial.printf("Set contrast: %d\n", contrastIdx);
+       } else {
+         pseudocolor = (pseudocolor + 1) % MAX_PALLETS;
+         setPseudocolor(pseudocolor);
+         if (VERBOSE) Serial.printf("Set pseudocolor: %d\n", pseudocolor);
+       }
+     }
+     lastBtnPressTime = now;
+     navMidDownTime = 0;
    }
-   lastBtnPressTime = now;
-   navMidDownTime = 0;
- }
 
- // Manual Shutter (works regardless of autoCalEnabled state)
- if(thumb){
-   if(thumbDownTime == 0 && now - thumbActionCooldown > 150){
-     thumbDownTime = now; 
-     thumbWasInteracted = false;
+   // Manual Shutter trigger
+   if(thumb){
+     if(thumbDownTime == 0 && now - thumbActionCooldown > 150){
+       thumbDownTime = now; 
+       thumbWasInteracted = false;
+     }
+   } else if(thumbDownTime){
+     unsigned long hold = now - thumbDownTime;
+     if(hold > 30 && hold < 500 && !thumbWasInteracted) {
+      manualShutter();
+      if (VERBOSE) Serial.printf("Trigger manual shutter\n");
+     }
+     thumbDownTime = 0;
+     thumbActionCooldown = now;
    }
- } else if(thumbDownTime){
-   unsigned long hold = now - thumbDownTime;
-   if(hold > 30 && hold < 500 && !thumbWasInteracted) {
-    manualShutter();
-    if(VERBOSE) Serial.printf("Trigger manual shutter\n");
-   }
-   thumbDownTime = 0;
-   thumbActionCooldown = now;
  }
 }
